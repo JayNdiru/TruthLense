@@ -1,0 +1,11 @@
+flask>=3.0
+flask-cors>=4.0
+requests>=2.31
+beautifulsoup4>=4.12
+feedparser>=6.0
+python-dotenv>=1.0
+
+# Optional ML (BERT-based analysis) — omit to use keyword fallback
+transformers>=4.36
+sentence-transformers>=2.2
+torch>=2.1
