@@ -4,13 +4,16 @@ TruthLens AI - Flask API Backend
 Provides REST API endpoints for the analytics dashboard
 """
 
-from flask import Flask, jsonify, request, render_template_string
+from flask import Flask, jsonify, request, render_template_string, g
 from flask_cors import CORS
 from truthlens_engine import TruthLensAnalyticsEngine
 from live_data_sources import LiveDataSourceRegistry
 from link_scrutinizer import LinkScrutinizer
 import sqlite3
 from datetime import datetime
+from collections import deque
+import threading
+import time as _time
 import json
 import os
 
@@ -23,6 +26,21 @@ except ImportError:
 
 app = Flask(__name__)
 CORS(app)
+
+# ── Server metrics ────────────────────────────────────────
+SERVER_START_TIME = _time.time()
+RESPONSE_TIMES = deque(maxlen=500)  # Rolling buffer of recent response times (ms)
+
+@app.before_request
+def _start_timer():
+    g.start_time = _time.time()
+
+@app.after_request
+def _record_response_time(response):
+    if hasattr(g, 'start_time'):
+        elapsed_ms = (_time.time() - g.start_time) * 1000
+        RESPONSE_TIMES.append(elapsed_ms)
+    return response
 
 # Initialize analytics engine & live data sources
 engine = TruthLensAnalyticsEngine()
@@ -57,6 +75,14 @@ def analyze():
     """
     try:
         data = request.json
+        if not data:
+            return jsonify({"success": False, "error": "Request body must be JSON"}), 400
+        content = data.get('content', '') or ''
+        headline = data.get('headline', '') or ''
+        if not content and not headline:
+            return jsonify({"success": False, "error": "Either 'content' or 'headline' is required"}), 400
+        if len(content) > 50000:
+            return jsonify({"success": False, "error": "Content exceeds 50,000 character limit"}), 400
         result = engine.analyze_content(data)
         return jsonify({"success": True, "data": result})
     except Exception as e:
@@ -82,12 +108,16 @@ def get_stats():
     
     real_content = summary['total_analyzed'] - summary['fake_detected']
     
+    # Compute real average response time from measured requests
+    avg_response_ms = round(sum(RESPONSE_TIMES) / max(len(RESPONSE_TIMES), 1), 1) if RESPONSE_TIMES else 0
+
     return jsonify({
         "total_analyzed": summary['total_analyzed'],
         "fake_detected": summary['fake_detected'],
         "real_content": real_content,
         "avg_credibility": summary['avg_credibility'],
-        "hourly_rate": 42000,  # Simulated
+        "hourly_rate": summary.get('hourly_rate', 0),
+        "avg_response_ms": avg_response_ms,
         "detection_accuracy": summary.get('detection_accuracy', 0),
         "model_backend": summary.get('model_backend', 'unknown'),
     })
@@ -309,76 +339,77 @@ def get_engine_metrics():
     
     live_accuracy = engine.compute_detection_accuracy()
 
-    # Pipeline stage metrics (simulated based on real data)
+    # Real DB counts for pipeline metrics
+    conn2 = sqlite3.connect(engine.db_path, timeout=10)
+    cur2 = conn2.cursor()
+    cur2.execute('SELECT COUNT(*) FROM fact_checks')
+    fc_db_size = cur2.fetchone()[0]
+    cur2.execute('SELECT COUNT(*) FROM source_ratings')
+    sr_db_size = cur2.fetchone()[0]
+    cur2.execute('SELECT COUNT(*) FROM content_analysis')
+    total_records = cur2.fetchone()[0]
+    conn2.close()
+
+    # Real average response time
+    avg_resp = round(sum(RESPONSE_TIMES) / max(len(RESPONSE_TIMES), 1), 1) if RESPONSE_TIMES else 0
+
     pipeline_metrics = {
         "ingestion": {
-            "throughput": hourly_processed,
-            "queue_size": random.randint(0, 50),
-            "avg_latency_ms": random.randint(5, 15)
+            "throughput_last_hour": hourly_processed,
+            "total_processed": total_records,
         },
         "nlp_analysis": {
             "processed_per_hour": hourly_processed,
-            "avg_processing_ms": random.randint(30, 50),
-            "model_accuracy": live_accuracy
+            "model_accuracy": live_accuracy,
+            "backend": "BERT" if engine.use_ml else "keyword",
         },
         "source_verification": {
-            "database_size": 15000,
-            "avg_lookup_ms": random.randint(2, 8),
-            "cache_hit_rate": random.uniform(85, 95)
+            "rated_sources_in_db": sr_db_size,
         },
         "fact_check_matching": {
-            "database_size": 500000,
-            "matches_found_rate": random.uniform(15, 25),
-            "avg_similarity_ms": random.randint(40, 80)
+            "claims_in_db": fc_db_size,
+            "google_api_active": engine._google_factcheck.available if engine._google_factcheck else False,
         },
         "credibility_scoring": {
-            "avg_score": round(avg_score_24h, 2),
-            "processing_ms": random.randint(10, 20),
-            "confidence_avg": random.uniform(0.82, 0.92)
+            "avg_score_24h": round(avg_score_24h, 2),
         },
         "output_generation": {
-            "total_outputs": hourly_processed,
-            "api_latency_ms": random.randint(5, 15),
-            "success_rate": random.uniform(99.5, 99.9)
+            "total_records": total_records,
+            "avg_api_latency_ms": avg_resp,
         }
     }
-    
+
     # Model performance metrics (reflect actual backend)
     backend = "BERT (bart-large-mnli + MiniLM)" if engine.use_ml else "Keyword heuristic"
     model_metrics = {
         "nlp_model": {
             "name": backend,
             "accuracy": live_accuracy,
-            "precision": round(live_accuracy - random.uniform(1, 3), 1),
-            "recall": round(live_accuracy - random.uniform(2, 4), 1),
-            "f1_score": round(live_accuracy - random.uniform(1.5, 3.5), 1),
             "inference_time_ms": 2200 if engine.use_ml else 45
-        },
-        "graph_analysis": {
-            "name": "Graph Neural Network (Custom)",
-            "viral_prediction_accuracy": 88.5,
-            "network_size": "50M+ nodes",
-            "processing_time_ms": 120
         },
         "ensemble_classifier": {
             "name": "BERT Zero-Shot + Sentence Embedder" if engine.use_ml else "Weighted Ensemble (keyword)",
             "overall_accuracy": live_accuracy,
-            "false_positive_rate": round(100 - live_accuracy - random.uniform(0, 2), 1),
-            "false_negative_rate": round(100 - live_accuracy + random.uniform(0, 2), 1),
         }
     }
-    
-    # System health
+
+    # System health — real values
+    uptime_seconds = _time.time() - SERVER_START_TIME
+    db_size_mb = 0
+    try:
+        db_size_mb = round(os.path.getsize(engine.db_path) / (1024 * 1024), 2)
+    except OSError:
+        pass
+
     system_health = {
         "status": "operational",
-        "uptime_hours": random.randint(120, 240),
-        "cpu_usage_percent": random.randint(35, 65),
-        "memory_usage_percent": random.randint(40, 70),
-        "api_response_time_ms": 87,
-        "database_size_mb": random.randint(250, 350),
+        "uptime_seconds": round(uptime_seconds),
+        "uptime_hours": round(uptime_seconds / 3600, 2),
+        "avg_response_time_ms": avg_resp,
+        "database_size_mb": db_size_mb,
         "last_health_check": datetime.now().isoformat()
     }
-    
+
     return jsonify({
         "real_examples": real_examples,
         "pipeline_metrics": pipeline_metrics,
@@ -395,23 +426,19 @@ def scrutinize_link():
     POST /api/scrutinize-link
     Body: { "url": "https://example.com/article" }
     
-    Returns: Comprehensive scrutiny report with:
-      - Page content extraction
-      - Google Safe Browsing check
-      - VirusTotal scan
-      - Fact-check database search
-      - Wayback Machine archive check
-      - News cross-reference
-      - NLP credibility analysis
-      - Overall risk assessment
+    Returns: Comprehensive scrutiny report.
     """
     try:
         data = request.json
+        if not data:
+            return jsonify({"success": False, "error": "Request body must be JSON"}), 400
         url = data.get('url', '').strip()
         if not url:
             return jsonify({"success": False, "error": "Missing 'url' field"}), 400
         if not url.startswith(('http://', 'https://')):
             return jsonify({"success": False, "error": "URL must start with http:// or https://"}), 400
+        if len(url) > 2048:
+            return jsonify({"success": False, "error": "URL exceeds 2048 character limit"}), 400
 
         report = scrutinizer.scrutinize(url)
         return jsonify({"success": True, "data": report})
@@ -513,11 +540,64 @@ def get_data_sources():
         ],
     })
 
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """
+    Server health check.
+
+    GET /api/health
+
+    Returns: Server uptime, DB status, data source availability.
+    """
+    uptime_seconds = _time.time() - SERVER_START_TIME
+    src_summary = registry.get_summary()
+
+    db_ok = False
+    db_size_mb = 0
+    try:
+        conn = sqlite3.connect(engine.db_path, timeout=5)
+        conn.execute('SELECT 1')
+        conn.close()
+        db_ok = True
+        db_size_mb = round(os.path.getsize(engine.db_path) / (1024 * 1024), 2)
+    except Exception:
+        pass
+
+    avg_resp = round(sum(RESPONSE_TIMES) / max(len(RESPONSE_TIMES), 1), 1) if RESPONSE_TIMES else 0
+
+    return jsonify({
+        "status": "healthy" if db_ok else "degraded",
+        "uptime_seconds": round(uptime_seconds),
+        "uptime_hours": round(uptime_seconds / 3600, 2),
+        "database": {"ok": db_ok, "size_mb": db_size_mb},
+        "data_sources": {
+            "active": src_summary['active_sources'],
+            "total": src_summary['total_sources'],
+            "missing_keys": src_summary['missing_api_keys'],
+        },
+        "avg_response_ms": avg_resp,
+        "model_backend": "BERT" if engine.use_ml else "keyword",
+        "checked_at": datetime.now().isoformat(),
+    })
+
+@app.route('/api/misinfo-summary', methods=['GET'])
+def misinfo_summary():
+    """
+    Aggregated misinformation statistics.
+
+    GET /api/misinfo-summary
+
+    Returns: count by source, trending keywords, fact-check match rate.
+    """
+    try:
+        data = engine.get_misinfo_summary()
+        return jsonify({"success": True, "data": data})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
 # ══════════════════════════════════════════════════════
 # LIVE RSS FACT-CHECK SYNC — refreshes every 30 minutes
 # ══════════════════════════════════════════════════════
-import threading
-import time as _time
 
 def rss_sync_loop():
     """Background thread that re-syncs RSS fact-checks every 30 minutes."""
@@ -534,14 +614,16 @@ def rss_sync_loop():
 
 def article_sync_loop():
     """Background thread that fetches real news articles and analyzes them.
+    Also pulls headlines from NewsAPI if the API key is configured.
     Runs every 15 minutes to keep the dashboard populated with real, clickable articles."""
     _time.sleep(5)  # Brief wait for server to start
     print("\n>> Live article sync thread started (every 15 min)")
     while True:
         try:
             added = engine.sync_live_articles()
+            newsapi_added = engine.sync_newsapi_articles()
             ts = datetime.now().strftime("%H:%M:%S")
-            print(f"   [{ts}] Article sync complete: {added} new articles with real URLs")
+            print(f"   [{ts}] Article sync complete: {added} RSS + {newsapi_added} NewsAPI")
         except Exception as e:
             print(f"   ✗ Article sync error: {e}")
         _time.sleep(900)  # 15 minutes
@@ -567,15 +649,17 @@ if __name__ == '__main__':
         print(f"   Set them in .env or environment variables to enable those sources")
     print("📊 Dashboard available at: http://localhost:8080")
     print("🔌 API endpoints:")
-    print("   POST /api/analyze - Analyze new content")
-    print("   POST /api/scrutinize-link - Scrutinize a URL (NEW - live data)")
-    print("   GET  /api/stats - Get dashboard statistics")
-    print("   GET  /api/recent - Get recent analyses")
-    print("   GET  /api/sources - Get source ratings")
-    print("   GET  /api/fact-checks - Get fact-check database")
-    print("   GET  /api/competitors - Get competitor analysis")
-    print("   GET  /api/data-sources - Get REAL live source status")
-    print("   GET  /api/engine-metrics - Get analytics engine metrics")
+    print("   POST /api/analyze           - Analyze new content")
+    print("   POST /api/scrutinize-link   - Scrutinize a URL (live data pipeline)")
+    print("   GET  /api/stats             - Dashboard statistics")
+    print("   GET  /api/recent            - Recent analyses")
+    print("   GET  /api/sources           - Source ratings")
+    print("   GET  /api/fact-checks       - Fact-check database")
+    print("   GET  /api/misinfo-summary   - Misinformation analytics")
+    print("   GET  /api/health            - Server health check")
+    print("   GET  /api/competitors       - Competitor comparison")
+    print("   GET  /api/data-sources      - Live data source status")
+    print("   GET  /api/engine-metrics    - Analytics engine metrics")
     print()
     
     # Try waitress first (more reliable, production-ready)

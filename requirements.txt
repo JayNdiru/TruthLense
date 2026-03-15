@@ -4,6 +4,7 @@ requests>=2.31
 beautifulsoup4>=4.12
 feedparser>=6.0
 python-dotenv>=1.0
+waitress>=2.1
 
 # Optional ML (BERT-based analysis) — omit to use keyword fallback
 transformers>=4.36

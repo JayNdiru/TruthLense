@@ -45,7 +45,7 @@ except ImportError:
 
 # ── Live data source imports ──
 try:
-    from live_data_sources import RSSFactCheckFetcher, RSSArticleFetcher
+    from live_data_sources import RSSFactCheckFetcher, RSSArticleFetcher, GoogleFactCheckAPI, NewsAPIClient
     _HAS_LIVE = True
 except ImportError:
     _HAS_LIVE = False
@@ -115,12 +115,15 @@ class TruthLensAnalyticsEngine:
         self._ml_lock = threading.Lock()   # thread safety for model inference
         self._rss_fetcher = RSSFactCheckFetcher() if _HAS_LIVE else None
         self._article_fetcher = RSSArticleFetcher() if _HAS_LIVE else None
+        self._google_factcheck = GoogleFactCheckAPI() if _HAS_LIVE else None
+        self._newsapi = NewsAPIClient() if _HAS_LIVE else None
         self.init_database()
         self.load_fact_checks()
         self.load_source_ratings()
         self.sync_live_fact_checks()   # Pull real fact-checks from RSS on startup
         self.sync_extended_source_ratings()  # Load broader source ratings
         self.sync_live_articles()      # Pull real news articles with real URLs
+        self.sync_newsapi_articles()   # Pull headlines from NewsAPI if key is set
         self._init_ml_models()
 
     # ────────────────────────────────────────────────────────────────────────
@@ -414,6 +417,63 @@ class TruthLensAnalyticsEngine:
             traceback.print_exc()
             return 0
 
+    def sync_newsapi_articles(self):
+        """Fetch top headlines from NewsAPI.org (if API key is set) and analyze them.
+        Complements the RSS article pipeline with additional sources.
+        Safe to call repeatedly — skips articles already in DB (by URL)."""
+        if not self._newsapi or not self._newsapi.available:
+            return 0
+
+        try:
+            headlines = self._newsapi.top_headlines(country='us', page_size=20)
+            if not headlines:
+                return 0
+
+            conn = sqlite3.connect(self.db_path, timeout=10)
+            cursor = conn.cursor()
+            cursor.execute('SELECT url FROM content_analysis WHERE url IS NOT NULL AND url != ""')
+            existing_urls = {row[0] for row in cursor.fetchall()}
+            conn.close()
+
+            inserted = 0
+            for article in headlines:
+                url = article.get('url', '')
+                if not url or url in existing_urls:
+                    continue
+                title = article.get('title', '').strip()
+                if not title or title == '[Removed]':
+                    continue
+
+                source_name = article.get('source', '')
+                content = article.get('content', '') or article.get('description', '') or title
+
+                try:
+                    base_shares = random.randint(500, 12000)
+                    input_data = {
+                        'content': content,
+                        'headline': title,
+                        'source': source_name,
+                        'url': url,
+                        'metadata': {
+                            'shares': base_shares,
+                            'likes': random.randint(base_shares // 5, base_shares // 2),
+                            'comments': random.randint(base_shares // 20, base_shares // 5),
+                        }
+                    }
+                    self.analyze_content(input_data)
+                    existing_urls.add(url)
+                    inserted += 1
+                except Exception as e:
+                    logger.debug('NewsAPI article analysis failed: %s', e)
+
+            if inserted:
+                print(f"✅ NewsAPI sync: {inserted} new headlines analyzed")
+            return inserted
+
+        except Exception as e:
+            print(f"⚠️  NewsAPI sync failed: {e}")
+            return 0
+
     def sync_extended_source_ratings(self):
         """Load an extended set of source credibility ratings beyond the 8 seed entries.
         These cover major news outlets, known misinformation sites, and social platforms."""
@@ -655,10 +715,23 @@ class TruthLensAnalyticsEngine:
     # ────────────────────────────────────────────────────────────────────────
 
     def _match_fact_checks(self, content, headline):
-        """Dispatch to semantic or keyword-based fact-check matching."""
+        """Dispatch to semantic or keyword-based fact-check matching,
+        then augment with Google Fact Check API results if available."""
         if self.use_ml:
-            return self._match_fact_checks_semantic(content, headline)
-        return self._match_fact_checks_keyword(content, headline)
+            local_matches = self._match_fact_checks_semantic(content, headline)
+        else:
+            local_matches = self._match_fact_checks_keyword(content, headline)
+
+        # Augment with Google Fact Check API (live cross-reference)
+        api_matches = self._match_fact_checks_google_api(content, headline)
+        if api_matches:
+            seen_urls = {m.get('url') for m in local_matches if m.get('url')}
+            for m in api_matches:
+                if m.get('url') not in seen_urls:
+                    local_matches.append(m)
+                    seen_urls.add(m.get('url'))
+
+        return local_matches[:5]
 
     def _match_fact_checks_semantic(self, content, headline):
         """Semantic similarity fact-check matching using sentence embeddings.
@@ -687,6 +760,28 @@ class TruthLensAnalyticsEngine:
                 })
 
         return sorted(matches, key=lambda x: x["confidence"], reverse=True)[:3]
+
+    def _match_fact_checks_google_api(self, content, headline):
+        """Query Google Fact Check Tools API for additional matches (if key is set)."""
+        if not self._google_factcheck or not self._google_factcheck.available:
+            return []
+        query = (headline or content[:200]).strip()
+        if not query:
+            return []
+        try:
+            results = self._google_factcheck.search_claim(query, max_results=3)
+            return [
+                {
+                    'source': r.get('source', 'Google Fact Check'),
+                    'verdict': r.get('verdict', 'CHECKED'),
+                    'url': r.get('url', ''),
+                    'confidence': 0.80,
+                }
+                for r in results
+            ]
+        except Exception as e:
+            logger.debug('Google Fact Check API query failed: %s', e)
+            return []
 
     def _match_fact_checks_keyword(self, content, headline):
         """Legacy keyword-overlap fact-check matching (fallback)."""
@@ -912,6 +1007,60 @@ class TruthLensAnalyticsEngine:
 
         return round((total / len(rows)) * 100, 1)
 
+    def get_misinfo_summary(self):
+        """Get aggregated misinformation statistics for the dashboard."""
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        cursor = conn.cursor()
+
+        # Count by source
+        cursor.execute('''
+            SELECT source, COUNT(*) as cnt
+            FROM content_analysis WHERE is_fake = 1
+            GROUP BY source ORDER BY cnt DESC LIMIT 10
+        ''')
+        by_source = [{'source': r[0], 'count': r[1]} for r in cursor.fetchall()]
+
+        # Trending keywords from fake headlines
+        cursor.execute('''
+            SELECT headline FROM content_analysis
+            WHERE is_fake = 1 ORDER BY processed_at DESC LIMIT 100
+        ''')
+        stop_words = {'the','a','an','is','are','was','were','in','on','at','to','for',
+                      'of','and','or','but','not','with','this','that','it','by','from',
+                      'as','has','had','have','be','been','if','its','no','so','do','did',
+                      'about','more','than','can','will','just','into','all','also','up',
+                      'out','new','says','said','over','after','he','she','they','we','us',
+                      'his','her','their','my','your','our','—','-','–','|','•',''}
+        word_counts = Counter()
+        for (headline,) in cursor.fetchall():
+            words = [w.strip('.,!?"\':;()[]') for w in headline.lower().split() if len(w) > 2]
+            word_counts.update(w for w in words if w not in stop_words)
+        trending = [{'keyword': w, 'count': c} for w, c in word_counts.most_common(15)]
+
+        # Fact-check match rate among fake articles
+        cursor.execute('SELECT COUNT(*) FROM content_analysis WHERE is_fake = 1')
+        total_fake = cursor.fetchone()[0]
+        cursor.execute('''
+            SELECT COUNT(*) FROM content_analysis
+            WHERE is_fake = 1 AND signals_json LIKE \'%"fact_check_match": 1%\'
+        ''')
+        fc_matched = cursor.fetchone()[0]
+        fc_match_rate = round(fc_matched / max(total_fake, 1) * 100, 1)
+
+        # Avg credibility of fake items
+        cursor.execute('SELECT AVG(credibility_score) FROM content_analysis WHERE is_fake = 1')
+        avg_fake_cred = cursor.fetchone()[0] or 0
+
+        conn.close()
+
+        return {
+            'total_fake': total_fake,
+            'by_source': by_source,
+            'trending_keywords': trending,
+            'fact_check_match_rate': fc_match_rate,
+            'avg_fake_credibility': round(avg_fake_cred, 2),
+        }
+
     def get_analytics_summary(self):
         """Get summary analytics for dashboard"""
         conn = sqlite3.connect(self.db_path, timeout=10)
@@ -928,6 +1077,10 @@ class TruthLensAnalyticsEngine:
         # Average credibility
         cursor.execute('SELECT AVG(credibility_score) FROM content_analysis')
         avg_cred = cursor.fetchone()[0] or 0
+
+        # Hourly rate (actual count from last hour)
+        cursor.execute("SELECT COUNT(*) FROM content_analysis WHERE processed_at > datetime('now', '-1 hour')")
+        hourly_rate = cursor.fetchone()[0]
         
         # Dynamic detection accuracy
         accuracy = self.compute_detection_accuracy()
@@ -947,6 +1100,7 @@ class TruthLensAnalyticsEngine:
             "total_analyzed": total,
             "fake_detected": fake,
             "avg_credibility": round(avg_cred, 2),
+            "hourly_rate": hourly_rate,
             "detection_accuracy": accuracy,
             "model_backend": "BERT (bart-large-mnli + MiniLM)" if self.use_ml else "Keyword heuristic",
             "recent_analyses": recent

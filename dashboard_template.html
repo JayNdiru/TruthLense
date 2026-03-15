@@ -670,6 +670,7 @@
 let DB = [];
 let SOURCES_DATA = [];
 let FACT_CHECKS_LIVE = [];
+let MISINFO_SUMMARY = {};
 let STATS = {};
 let REFRESH_COUNT = 0;
 
@@ -683,13 +684,15 @@ async function fetchJSON(url) {
 
 async function fetchLiveData() {
     const t = Date.now();
-    const [recent, sources, stats, factChecks, dataSources] = await Promise.all([
+    const [recent, sources, stats, factChecks, dataSources, misinfoResp] = await Promise.all([
         fetchJSON(`/api/recent?limit=50&_t=${t}`),
         fetchJSON(`/api/sources?_t=${t}`),
         fetchJSON(`/api/stats?_t=${t}`),
         fetchJSON(`/api/fact-checks?_t=${t}`),
         fetchJSON(`/api/data-sources?_t=${t}`),
+        fetchJSON(`/api/misinfo-summary?_t=${t}`),
     ]);
+    if (misinfoResp && misinfoResp.success) MISINFO_SUMMARY = misinfoResp.data;
 
     if (recent) {
         DB = recent.map((d, i) => ({
@@ -757,7 +760,7 @@ function updateStatCards() {
     const viralCount = DB.filter(d=>d.viral_velocity>=0.8).length;
     const accuracy = STATS.detection_accuracy ?? 0;
     const modelBackend = STATS.model_backend || 'unknown';
-    const avgResp = STATS.hourly_rate ? '87ms' : '87ms';
+    const avgResp = STATS.avg_response_ms ?? 0;
 
     document.getElementById('sv-total').textContent = totalArticles;
     document.getElementById('ss-total').textContent = `across ${uniqueSources} sources — click to view`;
@@ -765,8 +768,8 @@ function updateStatCards() {
     document.getElementById('ss-misinfo').textContent = `${totalArticles>0?(fakeCount/totalArticles*100).toFixed(1):'0'}% of total — click to view`;
     document.getElementById('sv-accuracy').textContent = accuracy + '%';
     document.getElementById('ss-accuracy').textContent = modelBackend + ' — click to view';
-    document.getElementById('sv-response').textContent = '87ms';
-    document.getElementById('ss-response').textContent = 'p99: 210ms — click to view';
+    document.getElementById('sv-response').textContent = avgResp > 0 ? avgResp.toFixed(0) + 'ms' : '—';
+    document.getElementById('ss-response').textContent = `${STATS.hourly_rate ?? 0} processed last hour — click to view`;
     document.getElementById('sv-viral').textContent = viralCount;
     document.getElementById('ss-viral').textContent = viralCount > 0 ? 'requires attention — click to view' : 'none — click to view';
 }
@@ -857,12 +860,53 @@ function drillDown(type) {
 
     if (type === 'misinfo') {
         const fakes = DB.filter(d => d.classification === 'fake');
+        const totalArticles = STATS.total_analyzed || DB.length;
+        const pct = totalArticles > 0 ? (fakes.length / totalArticles * 100).toFixed(1) : '0';
+        const avgFakeCred = MISINFO_SUMMARY.avg_fake_credibility ?? (fakes.length > 0 ? (fakes.reduce((a,d)=>a+d.credibility_score,0)/fakes.length).toFixed(1) : 0);
+        const fcRate = MISINFO_SUMMARY.fact_check_match_rate ?? 0;
+
+        // Top offending source
+        const srcCounts = {};
+        fakes.forEach(d => { srcCounts[d.source] = (srcCounts[d.source]||0) + 1; });
+        const topSrc = Object.entries(srcCounts).sort((a,b)=>b[1]-a[1])[0];
+
         html += '<div class="panel-title">Misinformation Detected (' + fakes.length + ' articles)</div>';
-        html += '<div class="spread-list">';
-        html += fakes.map(d => `
+
+        // Summary stat cards
+        html += '<div class="viral-summary" style="margin-bottom:16px">';
+        html += `<div class="vsm-card"><div class="vsm-val" style="color:var(--danger)">${fakes.length}</div><div class="vsm-lbl">Total Fake</div></div>`;
+        html += `<div class="vsm-card"><div class="vsm-val" style="color:var(--warn)">${pct}%</div><div class="vsm-lbl">of All Content</div></div>`;
+        html += `<div class="vsm-card"><div class="vsm-val" style="color:var(--danger)">${avgFakeCred}</div><div class="vsm-lbl">Avg Credibility</div></div>`;
+        html += `<div class="vsm-card"><div class="vsm-val" style="color:var(--accent)">${topSrc ? topSrc[0] : '—'}</div><div class="vsm-lbl">Top Source (${topSrc ? topSrc[1] : 0})</div></div>`;
+        html += '</div>';
+
+        // Trending narratives (keyword clusters from misinfo-summary API)
+        const trending = MISINFO_SUMMARY.trending_keywords || [];
+        if (trending.length > 0) {
+            html += '<div style="margin-bottom:16px"><div style="font-size:12px;font-weight:700;margin-bottom:8px;color:var(--text)">Trending Misinformation Narratives</div>';
+            html += '<div style="display:flex;flex-wrap:wrap;gap:6px">';
+            trending.forEach(kw => {
+                const size = Math.min(16, 10 + kw.count);
+                html += `<span style="padding:4px 10px;background:rgba(255,71,87,0.12);border:1px solid rgba(255,71,87,0.3);border-radius:4px;font-family:var(--mono);font-size:${size}px;color:var(--danger)">${kw.keyword} <span style="color:var(--muted);font-size:10px">${kw.count}</span></span>`;
+            });
+            html += '</div></div>';
+        }
+
+        // Top misinfo sources bar (inline canvas)
+        const bySource = MISINFO_SUMMARY.by_source || Object.entries(srcCounts).sort((a,b)=>b[1]-a[1]).slice(0,8).map(([s,c])=>({source:s,count:c}));
+        if (bySource.length > 0) {
+            html += '<div style="margin-bottom:16px"><div style="font-size:12px;font-weight:700;margin-bottom:8px;color:var(--text)">Top Misinformation Sources</div>';
+            html += '<div style="height:180px"><canvas id="misinfoSourceChart"></canvas></div></div>';
+        }
+
+        // Article list with inline signals + fact-check flag
+        html += '<div class="spread-list" style="max-height:400px;overflow-y:auto">';
+        html += fakes.sort((a,b)=>b.shares-a.shares).map(d => {
+            const fcFlag = d.signals.fact_check_match > 0 ? '<span style="color:var(--warn);font-size:10px;margin-left:6px">⚠ FACT-CHECKED</span>' : '';
+            return `
             <div class="spread-item is-fake">
                 <div>
-                    <div class="spread-headline">${hLink(d)}</div>
+                    <div class="spread-headline">${hLink(d)}${fcFlag}</div>
                     <div class="spread-meta">
                         <span>${d.source}</span>
                         <span style="color:var(--danger)">Score: ${d.credibility_score.toFixed(1)}</span>
@@ -870,15 +914,19 @@ function drillDown(type) {
                         <span class="badge badge-fake">FAKE</span>
                     </div>
                     <div style="margin-top:8px;font-size:11px;color:var(--muted);font-family:var(--mono)">
-                        Signals: Sensationalism ${(d.signals.sensationalism*100).toFixed(0)}% · Emotional ${(d.signals.emotional_language*100).toFixed(0)}% · Source Credibility ${(d.signals.source_credibility*100).toFixed(0)}%
+                        Sensationalism ${(d.signals.sensationalism*100).toFixed(0)}% · Emotional ${(d.signals.emotional_language*100).toFixed(0)}% · Source Cred ${(d.signals.source_credibility*100).toFixed(0)}% · Citations ${(d.signals.citation_quality*100).toFixed(0)}%
                     </div>
                 </div>
                 <div class="velocity-bar-wrap">
                     <div class="velocity-label"><span>VEL</span><span style="color:var(--danger);font-weight:600">${(d.viral_velocity*100).toFixed(0)}%</span></div>
                     <div class="velocity-bar"><div class="velocity-fill" style="width:${d.viral_velocity*100}%;background:var(--danger)"></div></div>
                 </div>
-            </div>`).join('');
+            </div>`;
+        }).join('');
         html += '</div>';
+
+        // Fact-check match rate
+        html += `<div style="margin-top:12px;font-size:11px;color:var(--muted);font-family:var(--mono)">Fact-check match rate among detected misinformation: <span style="color:var(--accent);font-weight:600">${fcRate}%</span></div>`;
     }
 
     if (type === 'accuracy') {
@@ -965,6 +1013,22 @@ function drillDown(type) {
     panel.style.display = 'block';
     panel.className = 'detail-panel';
     panel.scrollIntoView({ behavior:'smooth', block:'nearest' });
+
+    // Render inline misinfo source chart if present
+    if (type === 'misinfo') {
+        const bySource = MISINFO_SUMMARY.by_source || [];
+        const canvas = document.getElementById('misinfoSourceChart');
+        if (canvas && bySource.length > 0) {
+            new Chart(canvas, {
+                type: 'bar',
+                data: {
+                    labels: bySource.map(s => s.source.length > 20 ? s.source.slice(0,20)+'…' : s.source),
+                    datasets: [{ data: bySource.map(s => s.count), backgroundColor: 'rgba(255,71,87,0.7)', borderRadius: 4, borderSkipped: false }]
+                },
+                options: { ...GS, indexAxis: 'y', plugins: { ...GS.plugins, legend: { display: false } }, scales: { x: { ...GS.scales.x, title: { display: true, text: 'Articles', color: '#6b7280', font: { family: 'IBM Plex Mono', size: 10 } } }, y: { ...GS.scales.y } } }
+            });
+        }
+    }
 }
 
 function closeDrill() {
